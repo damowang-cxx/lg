@@ -1,6 +1,8 @@
 # app/graph.py
 from __future__ import annotations
 
+import json
+from app.llama_client import planner_json
 from typing import TypedDict, Literal, Optional, List, Dict, Any
 from langgraph.graph import StateGraph, START, END
 from langgraph.types import interrupt, Command
@@ -14,19 +16,47 @@ class ResearchState(TypedDict, total=False):
     status: str                                # 便于前端展示状态
 
 def align_node(state: ResearchState) -> Dict[str, Any]:
-    """把用户 topic 变成结构化研究计划（第一版先用规则生成，后续再接闭源 API）。"""
     topic = state["topic"]
-    plan = {
+
+    system = (
+        "你是研究规划智能体。你必须只输出一个JSON对象，作为研究计划plan。"
+        "不要输出任何解释。"
+    )
+    user = {
         "topic": topic,
-        "questions": [
-            f"{topic} 的核心概念是什么？",
-            f"{topic} 的关键分歧/争议点有哪些？",
-            f"{topic} 的时间线/阶段划分怎么做？",
-        ],
-        "sources": ["web", "local_notes", "papers"],
-        "deliverables": ["issue_tree", "timeline", "controversy_map", "citations"],
+        "mode": state.get("mode", "approval"),
+        "requirements": {
+            "must_have": ["topic", "domain", "questions", "sources", "deliverables"],
+            "sources_allowed": ["web", "papers", "primary_sources", "local_notes"],
+            "deliverables_examples": {
+                "history": ["issue_tree", "timeline", "controversy_map", "citations"],
+                "chemistry": ["concept_map", "mechanism_sheet", "formula_list", "citations"],
+            },
+        },
     }
-    return {"plan": plan, "status": "planned"}
+    try:
+        content = planner_json([
+            {"role": "system", "content": system},
+            {"role": "user", "content": json.dumps(user, ensure_ascii=False)},
+        ])
+        plan = json.loads(content)
+        return {"plan": plan, "status": "planned"}
+    except Exception as e:
+        # fallback：保证流程不中断
+        plan = {
+            "topic": topic,
+            "domain": "general",
+            "questions": [
+                f"{topic} 的核心概念是什么？",
+                f"{topic} 的关键分歧/争议点有哪些？",
+                f"{topic} 的时间线/阶段划分怎么做？",
+            ],
+            "sources": ["web", "local_notes", "papers"],
+            "deliverables": ["issue_tree", "timeline", "controversy_map", "citations"],
+            "planner_error": str(e),
+        }
+        return {"plan": plan, "status": "planned_fallback"}
+
 
 def route_after_align(state: ResearchState) -> Literal["approve_plan", "retrieve"]:
     """根据模式决定是否走审批节点。"""
@@ -70,26 +100,23 @@ def retrieve_node(state: ResearchState) -> Dict[str, Any]:
     return {"evidence": evidence, "status": "retrieved"}
 
 def synthesize_node(state: ResearchState) -> Dict[str, Any]:
-    """综合：第一版用规则输出“研究资产骨架”；后续接闭源模型 API 生成高质量资产。"""
     topic = state["topic"]
-    assets = {
-        "issue_tree": {
-            "root": topic,
-            "children": ["定义与边界", "关键理论/学派", "争议点", "关键事件与指标"],
-        },
-        "timeline": [
-            {"t": "T0", "event": "起源/背景（占位）"},
-            {"t": "T1", "event": "关键转折（占位）"},
-        ],
-        "controversy_map": [
-            {"claim": "观点A（占位）", "evidence_refs": [0]},
-            {"claim": "观点B（占位）", "evidence_refs": [1]},
-        ],
-        "citations": [
-            {"ref_id": 0, "title": state["evidence"][0]["title"], "locator": state["evidence"][0]["locator"]},
-            {"ref_id": 1, "title": state["evidence"][1]["title"], "locator": state["evidence"][1]["locator"]},
-        ],
-    }
+    plan = state.get("plan") or {}
+    deliverables = plan.get("deliverables") or ["issue_tree", "timeline", "controversy_map", "citations"]
+
+    assets: Dict[str, Any] = {}
+    for d in deliverables:
+        if d == "citations":
+            continue
+        assets[d] = {"_type": d, "topic": topic, "status": "placeholder"}
+
+    # citations 仍按 evidence 生成（避免空引用）
+    evs = state.get("evidence") or []
+    assets["citations"] = [
+        {"ref_id": i, "title": ev.get("title"), "locator": ev.get("locator")}
+        for i, ev in enumerate(evs)
+    ]
+
     return {"assets": assets, "status": "done"}
 
 def build_graph(checkpointer):

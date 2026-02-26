@@ -5,16 +5,17 @@ import json
 import os
 from uuid import uuid4
 from contextlib import asynccontextmanager
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Literal
 
 from fastapi import FastAPI
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.types import Command
 
 from app.graph import build_graph
+from app.llama_client import chat_text
 
 def _to_jsonable(obj):
     # 基本类型
@@ -49,10 +50,16 @@ def sse(event: str, data):
 
 class RunRequest(BaseModel):
     topic: str
-    mode: str = "approval"   # "auto" or "approval"
+    mode: Literal["auto", "approval"] = "approval"
 
 class ResumeRequest(BaseModel):
     value: Any               # True/False 或更复杂 JSON（以后可扩展）
+
+class ChatRequest(BaseModel):
+    message: str
+    history: list[dict[str, str]] = Field(default_factory=list)
+    temperature: float = 0.7
+    max_tokens: int = 512
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -63,6 +70,32 @@ async def lifespan(app: FastAPI):
         yield
 
 app = FastAPI(lifespan=lifespan)
+
+SSE_HEADERS = {
+    "Cache-Control": "no-cache",
+    "X-Accel-Buffering": "no",
+    "Connection": "keep-alive",
+}
+
+@app.post("/chat/stream")
+def chat_stream(req: ChatRequest):
+    thread_id = str(uuid4())
+
+    def gen():
+        yield sse("meta", {"thread_id": thread_id, "mode": "chat"})
+        try:
+            messages = []
+            # history 里放 [{"role":"user","content":"..."}, {"role":"assistant","content":"..."}]
+            messages.extend(req.history or [])
+            messages.append({"role": "user", "content": req.message})
+
+            reply = chat_text(messages, max_tokens=req.max_tokens, temperature=req.temperature)
+            yield sse("message", {"role": "assistant", "content": reply})
+            yield sse("done", {"thread_id": thread_id})
+        except Exception as e:
+            yield sse("error", {"message": str(e)})
+
+    return StreamingResponse(gen(), media_type="text/event-stream", headers=SSE_HEADERS)
 
 @app.post("/runs/stream")
 def run_stream(req: RunRequest):
@@ -76,7 +109,7 @@ def run_stream(req: RunRequest):
         yield sse("meta", {"thread_id": thread_id})
 
         try:
-            for chunk in graph.stream(...):
+            for chunk in graph.stream(inputs, config, stream_mode="updates"):
                 if isinstance(chunk, dict) and "__interrupt__" in chunk:
                     continue
                 yield sse("update", chunk)
